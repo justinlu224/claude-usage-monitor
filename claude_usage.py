@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code Pro Usage Monitor
+Claude Code Usage Monitor
 
 Reads local ~/.claude/ session data, groups by 5-hour windows,
 and generates Markdown or CSV reports.
@@ -38,7 +38,7 @@ WINDOW_HOURS = 5
 
 @dataclass
 class RateLimitEvent:
-    """Pro plan rate limit event (detected via Hook)."""
+    """Plan rate limit event (detected via Hook)."""
     timestamp: datetime
     session_id: str
     message: str         # e.g. "You've hit your limit · resets 8pm (Asia/Taipei)"
@@ -575,7 +575,7 @@ def generate_markdown_report(
 
     period = f"Last {days} days ({start_date} — {end_date})" if days else f"{start_date} — {end_date}"
 
-    lines.append("# Claude Code Pro Usage Report")
+    lines.append("# Claude Code Usage Report")
     lines.append("")
     lines.append(f"**Period:** {period}")
     lines.append("")
@@ -701,7 +701,7 @@ def generate_markdown_report(
 
     if matched_hook_events:
         lines.append(
-            f"1. **Plan limit reached:** Hit the Pro plan usage limit "
+            f"1. **Plan limit reached:** Hit the plan usage limit "
             f"{len(matched_hook_events)} time(s) during this period, "
             f"forcing work interruptions and directly impacting development efficiency."
         )
@@ -777,7 +777,7 @@ def generate_csv_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code Pro Usage Monitor — analyze session data and generate reports"
+        description="Claude Code Usage Monitor — analyze session data and generate reports"
     )
     parser.add_argument(
         "--days", type=int, default=30,

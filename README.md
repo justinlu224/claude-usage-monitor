@@ -1,12 +1,12 @@
 # claude-usage-monitor
 
-A local usage monitoring tool for Claude Code Pro. It reads session data from `~/.claude/`, analyzes usage patterns, and generates Markdown or CSV reports — ideal for reporting AI tool utilization to management.
+A local usage monitoring tool for Claude Code. It reads session data from `~/.claude/`, analyzes usage patterns, and generates Markdown or CSV reports — ideal for reporting AI tool utilization to management.
 
 ## Features
 
 - Scans all project sessions under `~/.claude/projects/`
 - Tracks AI interactions, working hours, and token usage
-- Detects Pro plan rate limit events via Claude Code Hook mechanism
+- Detects plan rate limit events via Claude Code Hook mechanism
 - Generates management-oriented Markdown reports (executive summary, task overview, daily work log)
 - Supports CSV export for further analysis
 
