@@ -1,6 +1,6 @@
-# claude-usage-monitor
+# claude-usage-report
 
-A local usage monitoring tool for Claude Code. It reads session data from `~/.claude/`, analyzes usage patterns, and generates Markdown or CSV reports — ideal for reporting AI tool utilization to management.
+A local usage reporting tool for Claude Code. It reads session data from `~/.claude/`, analyzes usage patterns, and generates Markdown reports — ideal for reporting AI tool utilization to management.
 
 ## Features
 
@@ -8,7 +8,6 @@ A local usage monitoring tool for Claude Code. It reads session data from `~/.cl
 - Tracks AI interactions, working hours, and token usage
 - Detects plan rate limit events via Claude Code Hook mechanism
 - Generates management-oriented Markdown reports (executive summary, task overview, daily work log)
-- Supports CSV export for further analysis
 
 ## Files
 
@@ -20,7 +19,7 @@ A local usage monitoring tool for Claude Code. It reads session data from `~/.cl
 ## Usage
 
 ```bash
-# Default: all projects, last 30 days, Markdown format
+# Default: all projects, last 30 days
 python3 claude_usage.py
 
 # Last 7 days
@@ -29,10 +28,7 @@ python3 claude_usage.py --days 7
 # Filter by project name
 python3 claude_usage.py --project my-project
 
-# CSV output to file
-python3 claude_usage.py --format csv --output ~/Desktop/report.csv
-
-# Save Markdown report to file
+# Save report to file
 python3 claude_usage.py --output ~/Desktop/report.md
 
 # Show all data (no day limit)
@@ -45,7 +41,6 @@ python3 claude_usage.py --days 0
 |--------|---------|-------------|
 | `--days` | 30 | Analyze last N days of data (0 = all) |
 | `--project` | none | Filter by project name (fuzzy match) |
-| `--format` | markdown | Output format: `markdown` or `csv` |
 | `--output` | stdout | Write output to file |
 | `--claude-dir` | `~/.claude` | Claude data directory path |
 
@@ -73,7 +68,7 @@ Add the following to `~/.claude/settings.json`:
 }
 ```
 
-Hook logs are stored at `~/claude-usage-monitor/logs/hook_events.jsonl` with automatic 30-day retention.
+Hook logs are stored at `~/claude-usage-report/logs/hook_events.jsonl` with automatic 30-day retention.
 
 ## Requirements
 

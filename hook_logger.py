@@ -8,16 +8,17 @@ Claude Code Hook Logger
   Hook 會透過 stdin 傳入 JSON 資料。
 
 日誌位置：
-  ~/claude-usage-monitor/logs/hook_events.jsonl
+  ~/claude-usage-report/logs/hook_events.jsonl
 """
 
 import json
-import sys
 import os
+import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 # 日誌目錄
-LOG_DIR = os.path.expanduser("~/claude-usage-monitor/logs")
+LOG_DIR = os.path.expanduser("~/claude-usage-report/logs")
 LOG_FILE = os.path.join(LOG_DIR, "hook_events.jsonl")
 
 # 保留天數（與報告預設一致）
@@ -25,30 +26,36 @@ RETENTION_DAYS = 30
 
 
 def cleanup_old_logs():
-    """刪除超過 RETENTION_DAYS 的日誌紀錄。"""
+    """Remove log entries older than RETENTION_DAYS using streaming write."""
     if not os.path.exists(LOG_FILE):
         return
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
-    kept = []
 
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line.strip())
-                    ts_str = rec.get("logged_at", "")
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if ts >= cutoff:
-                        kept.append(line)
-                except (json.JSONDecodeError, ValueError):
-                    # 無法解析的行保留，避免丟失資料
-                    kept.append(line)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=LOG_DIR,
+            prefix=".hook_cleanup_", suffix=".tmp", delete=False,
+        ) as tmp:
+            tmp_path = tmp.name
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        ts_str = rec.get("logged_at", "")
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if ts < cutoff:
+                            continue
+                    except (json.JSONDecodeError, ValueError):
+                        pass  # Keep unparseable lines to avoid data loss
+                    tmp.write(line)
+        os.replace(tmp_path, LOG_FILE)
     except (OSError, IOError):
-        return
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.writelines(kept)
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except (OSError, UnboundLocalError):
+            pass
 
 
 def main():
