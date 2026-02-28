@@ -3,19 +3,17 @@
 Claude Code Usage Monitor
 
 Reads local ~/.claude/ session data, groups by 5-hour windows,
-and generates Markdown or CSV reports.
+and generates a Markdown report.
 
 Usage:
     python3 claude_usage.py                        # All projects, last 30 days
     python3 claude_usage.py --days 7               # Last 7 days
     python3 claude_usage.py --project health-shop  # Filter by project
-    python3 claude_usage.py --format csv --output ~/Desktop/report.csv  # CSV
     python3 claude_usage.py --output ~/Desktop/report.md  # Save to file
 """
 
 import argparse
-import csv
-import io
+import html
 import json
 import os
 import sys
@@ -375,9 +373,8 @@ def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEve
     3. Message contains "resets" (fixed format, avoids false positives)
     """
     if not hook_log_path:
-        hook_log_path = os.path.expanduser(
-            "~/claude-usage-monitor/logs/hook_events.jsonl"
-        )
+        from hook_logger import LOG_FILE
+        hook_log_path = LOG_FILE
 
     events: list[RateLimitEvent] = []
 
@@ -467,7 +464,7 @@ def sanitize_text(text: str, max_len: int = 60) -> str:
     clean = clean.strip()
     if len(clean) > max_len:
         clean = clean[:max_len] + "…"
-    return clean
+    return html.escape(clean)
 
 
 def fmt_tokens(n: int) -> str:
@@ -517,16 +514,14 @@ def _is_meaningful_task(label: str) -> bool:
 # Report generators
 # ---------------------------------------------------------------------------
 
-def generate_markdown_report(
+def _prepare_report_data(
     sessions: list[SessionRecord],
     windows: list[Window],
-    days: int | None,
-    hook_events: list[RateLimitEvent] | None = None,
-) -> str:
-    """Generate a Markdown report for management."""
-    lines = []
+    hook_events: list[RateLimitEvent] | None,
+) -> dict:
+    """Prepare aggregated data used by all report sections."""
+    from collections import OrderedDict
 
-    # --- Prepare data ---
     total_messages = sum(s.message_count for s in sessions)
     total_duration = sum(
         min(sum(s.duration_minutes for s in w.sessions), WINDOW_HOURS * 60)
@@ -539,27 +534,22 @@ def generate_markdown_report(
         if e.session_id in session_map
     ]
 
-    # Collect meaningful tasks
     meaningful_tasks = []
     for s in sessions:
         label = sanitize_text(s.summary or s.first_prompt, max_len=80)
         if _is_meaningful_task(label):
             meaningful_tasks.append((label, s.project_name, s))
 
-    # Group sessions by local date
-    from collections import OrderedDict
     days_map: OrderedDict[str, list[SessionRecord]] = OrderedDict()
     for s in sessions:
         day = fmt_time(s.created).split(" ")[0]
         days_map.setdefault(day, []).append(s)
 
-    # Group rate limit events by local date
     rl_by_date: dict[str, list[RateLimitEvent]] = defaultdict(list)
     for evt in matched_hook_events:
         day = fmt_time(evt.timestamp).split(" ")[0]
         rl_by_date[day].append(evt)
 
-    # active_days = days that have meaningful tasks or rate limit events
     active_dates = set()
     for s in sessions:
         label = sanitize_text(s.summary or s.first_prompt, max_len=80)
@@ -567,9 +557,20 @@ def generate_markdown_report(
             active_dates.add(fmt_time(s.created).split(" ")[0])
     for evt in matched_hook_events:
         active_dates.add(fmt_time(evt.timestamp).split(" ")[0])
-    active_days = len(active_dates)
 
-    # --- Header ---
+    return {
+        "total_messages": total_messages,
+        "total_duration": total_duration,
+        "matched_hook_events": matched_hook_events,
+        "meaningful_tasks": meaningful_tasks,
+        "days_map": days_map,
+        "rl_by_date": rl_by_date,
+        "active_days": len(active_dates),
+    }
+
+
+def _render_header(sessions: list[SessionRecord], days: int | None) -> list[str]:
+    """Render report title and period line."""
     if sessions:
         start_date = fmt_time(sessions[0].created).split(" ")[0]
         end_date = datetime.now().strftime("%Y-%m-%d")
@@ -578,49 +579,64 @@ def generate_markdown_report(
 
     period = f"Last {days} days ({start_date} — {end_date})" if days else f"{start_date} — {end_date}"
 
-    lines.append("# Claude Code Usage Report")
-    lines.append("")
-    lines.append(f"**Period:** {period}")
-    lines.append("")
+    return [
+        "# Claude Code Usage Report",
+        "",
+        f"**Period:** {period}",
+        "",
+    ]
 
-    # --- Executive Summary ---
-    lines.append("## Executive Summary")
-    lines.append("")
-    lines.append(
+
+def _render_executive_summary(data: dict) -> list[str]:
+    """Render the Executive Summary section."""
+    lines = [
+        "## Executive Summary",
+        "",
         f"During this period, Claude Code AI assisted development across "
-        f"**{active_days}** active days, completing **{len(meaningful_tasks)}** tasks "
-        f"with **{total_messages}** AI interactions "
-        f"over approximately **{total_duration / 60:.1f} hours** of total working time."
-    )
-    if matched_hook_events:
+        f"**{data['active_days']}** active days, completing **{len(data['meaningful_tasks'])}** tasks "
+        f"with **{data['total_messages']}** AI interactions "
+        f"over approximately **{data['total_duration'] / 60:.1f} hours** of total working time.",
+    ]
+    if data["matched_hook_events"]:
         lines.append(
-            f"The plan usage limit was hit **{len(matched_hook_events)} time(s)**, "
+            f"The plan usage limit was hit **{len(data['matched_hook_events'])} time(s)**, "
             f"forcing work interruptions while waiting for reset."
         )
     lines.append("")
+    return lines
 
-    # --- Usage Overview (simplified key metrics) ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## Usage Overview")
-    lines.append("")
-    lines.append("| Metric | Value |")
-    lines.append("|--------|-------|")
-    lines.append(f"| Active Days | {active_days} |")
-    lines.append(f"| Total AI Interactions | {total_messages} |")
-    lines.append(f"| Total Working Hours | {total_duration / 60:.1f} hrs |")
-    lines.append(f"| Avg. Interactions / Day | {total_messages / max(active_days, 1):.0f} |")
-    lines.append(f"| Plan Limit Hits | {len(matched_hook_events)} |")
+
+def _render_usage_overview(data: dict) -> list[str]:
+    """Render the Usage Overview metrics table."""
+    active_days = data["active_days"]
+    total_messages = data["total_messages"]
+    matched_hook_events = data["matched_hook_events"]
+    meaningful_tasks = data["meaningful_tasks"]
+
+    lines = [
+        "---",
+        "",
+        "## Usage Overview",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Active Days | {active_days} |",
+        f"| Total AI Interactions | {total_messages} |",
+        f"| Total Working Hours | {data['total_duration'] / 60:.1f} hrs |",
+        f"| Avg. Interactions / Day | {total_messages / max(active_days, 1):.0f} |",
+        f"| Plan Limit Hits | {len(matched_hook_events)} |",
+    ]
     projects_with_tasks = list(dict.fromkeys(proj for _, proj, _ in meaningful_tasks))
     if projects_with_tasks:
-        lines.append(f"| Projects | {', '.join(projects_with_tasks)} |")
+        lines.append(f"| Projects | {', '.join(html.escape(p) for p in projects_with_tasks)} |")
     lines.append("")
+    return lines
 
-    # --- Tasks completed ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## Completed Tasks")
-    lines.append("")
+
+def _render_completed_tasks(data: dict) -> list[str]:
+    """Render the Completed Tasks section grouped by project."""
+    meaningful_tasks = data["meaningful_tasks"]
+    lines = ["---", "", "## Completed Tasks", ""]
 
     if meaningful_tasks:
         tasks_by_project: dict[str, list[str]] = defaultdict(list)
@@ -628,7 +644,7 @@ def generate_markdown_report(
             tasks_by_project[proj].append(label)
 
         for proj, tasks in tasks_by_project.items():
-            lines.append(f"### {proj}")
+            lines.append(f"### {html.escape(proj)}")
             lines.append("")
             for t in tasks:
                 lines.append(f"- {t}")
@@ -637,33 +653,31 @@ def generate_markdown_report(
         lines.append("(No identifiable work items recorded)")
         lines.append("")
 
-    # --- AI Work Log (daily timeline + rate limits) ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## AI Work Log")
-    lines.append("")
+    return lines
+
+
+def _render_work_log(data: dict) -> list[str]:
+    """Render the AI Work Log with daily timeline and rate limit events."""
+    days_map = data["days_map"]
+    rl_by_date = data["rl_by_date"]
+    lines = ["---", "", "## AI Work Log", ""]
 
     for day, day_sessions in days_map.items():
-        # Collect meaningful tasks for this day
         day_tasks = []
         for s in day_sessions:
             label = sanitize_text(s.summary or s.first_prompt, max_len=80)
             if _is_meaningful_task(label):
                 day_tasks.append(label)
 
-        # Rate limit events for this day
         day_rl = rl_by_date.get(day, [])
 
-        # Skip days with no meaningful tasks and no rate limit events
         if not day_tasks and not day_rl:
             continue
 
-        # Day header: session count + duration
         session_count = len(day_sessions)
         raw_dur = sum(s.duration_minutes for s in day_sessions)
         day_dur = min(raw_dur, WINDOW_HOURS * 60)
 
-        # Check if any session spans beyond this day
         last_modified = max(s.modified for s in day_sessions)
         last_mod_day = fmt_time(last_modified).split(" ")[0]
 
@@ -679,28 +693,27 @@ def generate_markdown_report(
         for t in day_tasks:
             lines.append(f"- {t}")
 
-        # Inline rate limit events
         for evt in day_rl:
-            # Extract reset time from message (e.g. "resets 11pm")
             msg = evt.message
             reset_part = ""
             if "resets" in msg.lower():
                 idx = msg.lower().index("resets")
                 reset_part = msg[idx:].strip()
-                # Clean up: "resets 11pm (Asia/Taipei)" → "resets 11pm"
                 if "(" in reset_part:
                     reset_part = reset_part[:reset_part.index("(")].strip()
             lines.append(
-                f"- Hit plan limit — work interrupted, waiting for reset ({reset_part})"
+                f"- Hit plan limit — work interrupted, waiting for reset ({html.escape(reset_part)})"
             )
 
         lines.append("")
 
-    # --- Conclusion ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## Conclusion & Recommendations")
-    lines.append("")
+    return lines
+
+
+def _render_conclusion(data: dict) -> list[str]:
+    """Render the Conclusion & Recommendations section."""
+    matched_hook_events = data["matched_hook_events"]
+    lines = ["---", "", "## Conclusion & Recommendations", ""]
 
     if matched_hook_events:
         lines.append(
@@ -722,56 +735,25 @@ def generate_markdown_report(
             "Consider upgrading if limits are reached and work is interrupted."
         )
     lines.append("")
+    return lines
 
-    return "\n".join(lines)
 
-
-def generate_csv_report(
+def generate_markdown_report(
     sessions: list[SessionRecord],
     windows: list[Window],
+    days: int | None,
     hook_events: list[RateLimitEvent] | None = None,
 ) -> str:
-    """Generate CSV report, one row per session."""
-    # Build session -> window mapping
-    session_window: dict[str, int] = {}
-    for i, w in enumerate(windows, 1):
-        for s in w.sessions:
-            session_window[s.session_id] = i
-
-    # Build session_id -> hit_limit count from hook events
-    hit_limit_count: dict[str, int] = defaultdict(int)
-    for evt in (hook_events or []):
-        hit_limit_count[evt.session_id] += 1
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "date", "start_time", "end_time", "project", "summary",
-        "messages", "duration_min", "input_tokens", "output_tokens",
-        "cache_read_tokens", "cache_creation_tokens", "total_tokens",
-        "hit_limit", "window_id", "git_branch",
-    ])
-
-    for s in sessions:
-        writer.writerow([
-            fmt_time(s.created).split(" ")[0],
-            fmt_time(s.created),
-            fmt_time(s.modified),
-            s.project_name,
-            s.summary or s.first_prompt[:80],
-            s.message_count,
-            round(s.duration_minutes, 1),
-            s.input_tokens,
-            s.output_tokens,
-            s.cache_read_tokens,
-            s.cache_creation_tokens,
-            s.total_tokens,
-            hit_limit_count.get(s.session_id, 0),
-            session_window.get(s.session_id, 0),
-            s.git_branch,
-        ])
-
-    return output.getvalue()
+    """Generate a Markdown report for management."""
+    data = _prepare_report_data(sessions, windows, hook_events)
+    lines = []
+    lines.extend(_render_header(sessions, days))
+    lines.extend(_render_executive_summary(data))
+    lines.extend(_render_usage_overview(data))
+    lines.extend(_render_completed_tasks(data))
+    lines.extend(_render_work_log(data))
+    lines.extend(_render_conclusion(data))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -789,10 +771,6 @@ def main():
     parser.add_argument(
         "--project", type=str, default=None,
         help="Filter by project name (fuzzy match)"
-    )
-    parser.add_argument(
-        "--format", choices=["markdown", "csv"], default="markdown",
-        help="Output format (default: markdown)"
     )
     parser.add_argument(
         "--output", type=str, default=None,
@@ -831,10 +809,7 @@ def main():
     hook_events = load_hook_rate_limits()
 
     # Generate report
-    if args.format == "csv":
-        report = generate_csv_report(sessions, windows, hook_events)
-    else:
-        report = generate_markdown_report(sessions, windows, effective_days, hook_events)
+    report = generate_markdown_report(sessions, windows, effective_days, hook_events)
 
     # Output
     if args.output:
