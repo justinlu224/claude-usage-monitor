@@ -628,7 +628,7 @@ def _render_usage_overview(data: dict) -> list[str]:
     ]
     projects_with_tasks = list(dict.fromkeys(proj for _, proj, _ in meaningful_tasks))
     if projects_with_tasks:
-        lines.append(f"| Projects | {', '.join(html.escape(p) for p in projects_with_tasks)} |")
+        lines.append(f"| Projects | {', '.join(sanitize_text(p) for p in projects_with_tasks)} |")
     lines.append("")
     return lines
 
@@ -644,7 +644,7 @@ def _render_completed_tasks(data: dict) -> list[str]:
             tasks_by_project[proj].append(label)
 
         for proj, tasks in tasks_by_project.items():
-            lines.append(f"### {html.escape(proj)}")
+            lines.append(f"### {sanitize_text(proj)}")
             lines.append("")
             for t in tasks:
                 lines.append(f"- {t}")
