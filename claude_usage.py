@@ -26,17 +26,22 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+WINDOW_HOURS = 5
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
 @dataclass
 class RateLimitEvent:
-    """單次 API 錯誤（限速/過載）事件。"""
+    """Pro 方案用量上限事件（透過 Hook 偵測）。"""
     timestamp: datetime
-    status: int          # 429=rate_limit, 529=overloaded
-    error_type: str      # e.g. "overloaded_error", "rate_limit_error"
-    retry_attempt: int
-    retry_wait_ms: float
+    session_id: str
+    message: str         # e.g. "You've hit your limit · resets 8pm (Asia/Taipei)"
 
 
 @dataclass
@@ -55,8 +60,6 @@ class SessionRecord:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
-    # Rate limit events
-    rate_limit_events: list = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -65,16 +68,19 @@ class SessionRecord:
 
     @property
     def duration_minutes(self) -> float:
+        """Session 工作時長（分鐘）。
+
+        異常值處理：
+        - 超過 5 小時（如 /resume 跨天）→ 以訊息數估算（每則約 1 分鐘）
+        - 低於 1 分鐘但訊息數多（如壓縮後續接）→ 以訊息數估算
+        """
         delta = self.modified - self.created
-        return max(delta.total_seconds() / 60, 0)
-
-    @property
-    def rate_limit_count(self) -> int:
-        return len(self.rate_limit_events)
-
-    @property
-    def total_retry_wait_ms(self) -> float:
-        return sum(e.retry_wait_ms for e in self.rate_limit_events)
+        mins = max(delta.total_seconds() / 60, 0)
+        if mins > WINDOW_HOURS * 60:
+            return float(self.message_count)
+        if mins < 1 and self.message_count > 5:
+            return float(self.message_count)
+        return mins
 
 
 @dataclass
@@ -111,18 +117,6 @@ class Window:
     def projects(self) -> list:
         return list(dict.fromkeys(s.project_name for s in self.sessions))
 
-    @property
-    def total_rate_limits(self) -> int:
-        return sum(s.rate_limit_count for s in self.sessions)
-
-    @property
-    def total_retry_wait_seconds(self) -> float:
-        return sum(s.total_retry_wait_ms for s in self.sessions) / 1000
-
-    @property
-    def has_rate_limit(self) -> bool:
-        return self.total_rate_limits > 0
-
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -139,12 +133,38 @@ def get_project_name(project_path: str) -> str:
     return Path(project_path).name if project_path else "unknown"
 
 
+def _extract_user_text(rec: dict) -> str:
+    """從 user record 中提取文字內容。"""
+    content = rec.get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                return c.get("text", "").strip()
+    return ""
+
+
+# 系統訊息的前綴特徵，不是真正的使用者輸入
+_SYSTEM_PREFIXES = (
+    "<",              # XML tags: <command-name>, <local-command-*>, <system-reminder>
+    "Caveat:",        # Claude Code 自動產生的 caveat 訊息
+    "Base directory", # Skill 載入提示
+    "[Request ",      # [Request interrupted by user]
+)
+
+
+def _is_real_user_input(text: str) -> bool:
+    """判斷文字是否為真正的使用者輸入（非系統訊息）。"""
+    return not text.startswith(_SYSTEM_PREFIXES)
+
+
 def parse_jsonl(jsonl_path: str) -> dict:
     """Parse a session JSONL file for token usage and metadata.
 
     Returns a dict with keys: input_tokens, output_tokens, cache_read_tokens,
     cache_creation_tokens, first_ts, last_ts, first_prompt, user_msg_count,
-    git_branch, cwd, summary, rate_limit_events.
+    git_branch, cwd, summary.
     """
     result = {
         "input_tokens": 0,
@@ -158,7 +178,6 @@ def parse_jsonl(jsonl_path: str) -> dict:
         "git_branch": "",
         "cwd": "",
         "summary": "",
-        "rate_limit_events": [],
     }
 
     try:
@@ -193,21 +212,9 @@ def parse_jsonl(jsonl_path: str) -> dict:
                     if not result["cwd"]:
                         result["cwd"] = rec.get("cwd", "")
                     if not result["first_prompt"]:
-                        content = rec.get("message", {}).get("content", "")
-                        if isinstance(content, str):
-                            # Strip XML-like tags from auto-generated prompts
-                            text = content
-                            if text.startswith("<"):
-                                # Try to find actual text after tags
-                                import re
-                                cleaned = re.sub(r"<[^>]+>", "", text).strip()
-                                text = cleaned if cleaned else text
+                        text = _extract_user_text(rec)
+                        if text and _is_real_user_input(text):
                             result["first_prompt"] = text[:80]
-                        elif isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    result["first_prompt"] = c.get("text", "")[:80]
-                                    break
 
                 # Sum token usage from assistant records
                 if rec_type == "assistant":
@@ -218,19 +225,6 @@ def parse_jsonl(jsonl_path: str) -> dict:
                         result["cache_read_tokens"] += msg_usage.get("cache_read_input_tokens", 0)
                         result["cache_creation_tokens"] += msg_usage.get("cache_creation_input_tokens", 0)
 
-                # Capture rate limit / overload errors
-                if (rec_type == "system"
-                        and rec.get("subtype") == "api_error"
-                        and ts):
-                    err = rec.get("error", {})
-                    inner = err.get("error", {}).get("error", {})
-                    result["rate_limit_events"].append(RateLimitEvent(
-                        timestamp=parse_timestamp(ts),
-                        status=err.get("status", 0),
-                        error_type=inner.get("type", "unknown"),
-                        retry_attempt=rec.get("retryAttempt", 0),
-                        retry_wait_ms=rec.get("retryInMs", 0),
-                    ))
     except (OSError, IOError):
         pass
 
@@ -316,7 +310,6 @@ def load_all_sessions(
                     output_tokens=parsed.get("output_tokens", 0),
                     cache_read_tokens=parsed.get("cache_read_tokens", 0),
                     cache_creation_tokens=parsed.get("cache_creation_tokens", 0),
-                    rate_limit_events=parsed.get("rate_limit_events", []),
                 ))
 
         # --- Phase 2: Pick up unindexed JSONL files ---
@@ -358,36 +351,72 @@ def load_all_sessions(
                 output_tokens=parsed["output_tokens"],
                 cache_read_tokens=parsed["cache_read_tokens"],
                 cache_creation_tokens=parsed["cache_creation_tokens"],
-                rate_limit_events=parsed.get("rate_limit_events", []),
             ))
 
     sessions.sort(key=lambda s: s.created)
     return sessions
 
 
+
+
+def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEvent]:
+    """從 Hook 日誌讀取方案上限事件。
+
+    Hook 日誌由 hook_logger.py 寫入，當 Stop 事件的
+    last_assistant_message 以 "You've hit your limit" 開頭時，即為方案限速。
+
+    判斷條件（必須全部滿足）：
+    1. hook_event == "Stop"
+    2. last_assistant_message 以 "You've hit your limit" 開頭
+    3. 訊息中包含 "resets"（限速訊息固定格式，避免誤判對話內容）
+    """
+    if not hook_log_path:
+        hook_log_path = os.path.expanduser(
+            "~/claude-usage-monitor/logs/hook_events.jsonl"
+        )
+
+    events: list[RateLimitEvent] = []
+
+    if not os.path.exists(hook_log_path):
+        return events
+
+    try:
+        with open(hook_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if rec.get("hook_event") != "Stop":
+                    continue
+
+                data = rec.get("data", {})
+                msg = data.get("last_assistant_message", "")
+
+                # 嚴格判斷：必須以固定格式開頭且包含 resets
+                if not (msg.startswith("You've hit your limit")
+                        and "resets" in msg.lower()):
+                    continue
+
+                events.append(RateLimitEvent(
+                    timestamp=parse_timestamp(rec["logged_at"]),
+                    session_id=data.get("session_id", ""),
+                    message=msg.strip(),
+                ))
+    except (OSError, IOError):
+        pass
+
+    return events
+
+
+
 # ---------------------------------------------------------------------------
 # Windowing
 # ---------------------------------------------------------------------------
-
-WINDOW_HOURS = 5
-
-# 高負載定義：滿足以下任一條件即為高負載週期
-# 1. 週期內 sessions 數 ≥ 3
-# 2. 週期內總訊息數 ≥ 50
-# 3. 週期內總 output tokens ≥ 50K
-HEAVY_MIN_SESSIONS = 3
-HEAVY_MIN_MESSAGES = 50
-HEAVY_MIN_OUTPUT_TOKENS = 50_000
-
-
-def is_heavy_window(w) -> bool:
-    """判定是否為高負載週期。"""
-    return (
-        len(w.sessions) >= HEAVY_MIN_SESSIONS
-        or w.total_messages >= HEAVY_MIN_MESSAGES
-        or w.total_output_tokens >= HEAVY_MIN_OUTPUT_TOKENS
-    )
-
 
 def group_into_windows(sessions: list[SessionRecord]) -> list[Window]:
     """Group sessions into rolling 5-hour windows."""
@@ -426,6 +455,12 @@ def group_into_windows(sessions: list[SessionRecord]) -> list[Window]:
 def sanitize_text(text: str, max_len: int = 60) -> str:
     """Sanitize text for Markdown table cells (strip newlines, truncate)."""
     clean = text.replace("\n", " ").replace("\r", " ").replace("|", "/").strip()
+    # 清理 markdown 語法
+    import re
+    clean = re.sub(r"#{1,6}\s*", "", clean)      # ## heading → heading
+    clean = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", clean)  # **bold** → bold
+    clean = re.sub(r"\s{2,}", " ", clean)         # 多餘空白
+    clean = clean.strip()
     if len(clean) > max_len:
         clean = clean[:max_len] + "…"
     return clean
@@ -452,6 +487,29 @@ def fmt_time_short(dt: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Task filtering
+# ---------------------------------------------------------------------------
+
+# 非實質工作的關鍵字，從任務清單中排除
+_SKIP_TASK_KEYWORDS = (
+    "Summarize this",
+    "claude install",
+    "npm run",
+    "git ",
+)
+
+
+def _is_meaningful_task(label: str) -> bool:
+    """判斷任務摘要是否為有意義的實質工作。"""
+    if not label or len(label) < 5:
+        return False
+    for kw in _SKIP_TASK_KEYWORDS:
+        if label.lower().startswith(kw.lower()):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Report generators
 # ---------------------------------------------------------------------------
 
@@ -459,234 +517,213 @@ def generate_markdown_report(
     sessions: list[SessionRecord],
     windows: list[Window],
     days: int | None,
+    hook_events: list[RateLimitEvent] | None = None,
 ) -> str:
     """Generate a Markdown report for management."""
     lines = []
 
-    # Header
+    # --- Prepare data ---
+    total_messages = sum(s.message_count for s in sessions)
+    total_duration = sum(
+        min(sum(s.duration_minutes for s in w.sessions), WINDOW_HOURS * 60)
+        for w in windows
+    )
+
+    session_map = {s.session_id: s for s in sessions}
+    matched_hook_events = [
+        e for e in (hook_events or [])
+        if e.session_id in session_map
+    ]
+
+    # Collect meaningful tasks
+    meaningful_tasks = []
+    for s in sessions:
+        label = sanitize_text(s.summary or s.first_prompt, max_len=80)
+        if _is_meaningful_task(label):
+            meaningful_tasks.append((label, s.project_name, s))
+
+    # Group sessions by local date
+    from collections import OrderedDict
+    days_map: OrderedDict[str, list[SessionRecord]] = OrderedDict()
+    for s in sessions:
+        day = fmt_time(s.created).split(" ")[0]
+        days_map.setdefault(day, []).append(s)
+
+    # Group rate limit events by local date
+    rl_by_date: dict[str, list[RateLimitEvent]] = defaultdict(list)
+    for evt in matched_hook_events:
+        day = fmt_time(evt.timestamp).split(" ")[0]
+        rl_by_date[day].append(evt)
+
+    # active_days = days that have meaningful tasks or rate limit events
+    active_dates = set()
+    for s in sessions:
+        label = sanitize_text(s.summary or s.first_prompt, max_len=80)
+        if _is_meaningful_task(label):
+            active_dates.add(fmt_time(s.created).split(" ")[0])
+    for evt in matched_hook_events:
+        active_dates.add(fmt_time(evt.timestamp).split(" ")[0])
+    active_days = len(active_dates)
+
+    # --- Header ---
     if sessions:
         start_date = fmt_time(sessions[0].created).split(" ")[0]
-        end_date = fmt_time(sessions[-1].created).split(" ")[0]
+        end_date = datetime.now().strftime("%Y-%m-%d")
     else:
         start_date = end_date = "N/A"
 
+    period = f"近 {days} 天（{start_date} — {end_date}）" if days else f"{start_date} — {end_date}"
+
     lines.append("# Claude Code Pro 使用報告")
     lines.append("")
-    period = f"近 {days} 天（{start_date} — {end_date}）" if days else f"{start_date} — {end_date}"
-    lines.append(f"**期間：** {period}")
-    lines.append(
-        f"**5 小時週期數：** {len(windows)}  |  "
-        f"**總 session 數：** {len(sessions)}  |  "
-        f"**總對話數：** {sum(s.message_count for s in sessions)}"
-    )
+    lines.append(f"**報告期間：** {period}")
     lines.append("")
 
-    # Summary table
+    # --- Executive Summary ---
+    lines.append("## 執行摘要")
+    lines.append("")
+    lines.append(
+        f"本期間內透過 Claude Code AI 輔助，在 **{active_days}** 個工作日中"
+        f"完成 **{len(meaningful_tasks)}** 項開發任務，"
+        f"累計 **{total_messages}** 次 AI 互動，"
+        f"總工作時長約 **{total_duration / 60:.1f} 小時**。"
+    )
+    if matched_hook_events:
+        lines.append(
+            f"期間內 **{len(matched_hook_events)} 次觸及方案用量上限**，"
+            f"導致工作被迫中斷等待重置。"
+        )
+    lines.append("")
+
+    # --- Usage Overview (simplified key metrics) ---
     lines.append("---")
     lines.append("")
-    lines.append("## 摘要")
+    lines.append("## 使用概況")
     lines.append("")
     lines.append("| 指標 | 數值 |")
     lines.append("|------|------|")
-    lines.append(f"| 活躍 5 小時週期 | {len(windows)} |")
-
-    heavy_windows = sum(1 for w in windows if is_heavy_window(w))
-    lines.append(f"| 高負載週期 | {heavy_windows} |")
-
-    total_output = sum(s.output_tokens for s in sessions)
-    lines.append(f"| 總 output tokens | {fmt_tokens(total_output)} |")
-
-    total_input = sum(s.input_tokens for s in sessions)
-    lines.append(f"| 總 input tokens | {fmt_tokens(total_input)} |")
-
-    total_cache = sum(s.cache_read_tokens + s.cache_creation_tokens for s in sessions)
-    lines.append(f"| 總 cache tokens | {fmt_tokens(total_cache)} |")
-
-    total_rl = sum(s.rate_limit_count for s in sessions)
-    rl_windows = sum(1 for w in windows if w.has_rate_limit)
-    total_rl_wait = sum(s.total_retry_wait_ms for s in sessions) / 1000
-    lines.append(f"| 限速/過載次數 | {total_rl} 次（影響 {rl_windows} 個週期） |")
-    if total_rl_wait > 0:
-        lines.append(f"| 限速等待總時間 | {total_rl_wait:.1f} 秒 |")
-
-    # Most active day
-    day_msgs: dict[str, int] = defaultdict(int)
-    day_sessions: dict[str, int] = defaultdict(int)
-    for s in sessions:
-        day_key = fmt_time(s.created).split(" ")[0]
-        day_msgs[day_key] += s.message_count
-        day_sessions[day_key] += 1
-
-    if day_msgs:
-        busiest = max(day_msgs, key=day_msgs.get)
-        lines.append(
-            f"| 最活躍日 | {busiest}"
-            f"（{day_sessions[busiest]} sessions, {day_msgs[busiest]} 則訊息） |"
-        )
-
-    # Projects
-    all_projects = list(dict.fromkeys(s.project_name for s in sessions))
-    lines.append(f"| 涵蓋專案 | {', '.join(all_projects)} |")
+    lines.append(f"| 活躍工作日 | {active_days} 天 |")
+    lines.append(f"| AI 互動總數 | {total_messages} |")
+    lines.append(f"| 總使用時長 | {total_duration / 60:.1f} 小時 |")
+    lines.append(f"| 平均每日互動數 | {total_messages / max(active_days, 1):.0f} |")
+    lines.append(f"| 觸及方案上限 | {len(matched_hook_events)} 次 |")
+    projects_with_tasks = list(dict.fromkeys(proj for _, proj, _ in meaningful_tasks))
+    if projects_with_tasks:
+        lines.append(f"| 涵蓋專案 | {', '.join(projects_with_tasks)} |")
     lines.append("")
 
-    # Tasks completed
-    lines.append("## 完成的主要任務")
-    lines.append("")
-    for s in sessions:
-        label = sanitize_text(s.summary or s.first_prompt, max_len=80)
-        if label:
-            lines.append(f"- {label} ({s.project_name})")
-    lines.append("")
-
-    # Window details
+    # --- Tasks completed ---
     lines.append("---")
     lines.append("")
-    lines.append("## 各 5 小時週期明細")
+    lines.append("## 完成任務總覽")
     lines.append("")
 
-    for i, w in enumerate(windows, 1):
-        tags = []
-        if is_heavy_window(w):
-            tags.append("HIGH")
-        if w.has_rate_limit:
-            tags.append("RATE-LIMITED")
-        tag_str = f" [{', '.join(tags)}]" if tags else ""
-        lines.append(
-            f"### 週期 {i} — {fmt_time(w.anchor)} ~ {fmt_time_short(w.end)}{tag_str}"
-        )
-        stats_parts = [
-            f"**Sessions:** {len(w.sessions)}",
-            f"**訊息:** {w.total_messages}",
-            f"**Output tokens:** {fmt_tokens(w.total_output_tokens)}",
-        ]
-        if w.has_rate_limit:
-            stats_parts.append(
-                f"**限速:** {w.total_rate_limits} 次（等待 {w.total_retry_wait_seconds:.1f}s）"
-            )
-        lines.append("  |  ".join(stats_parts))
-        lines.append("")
-        lines.append("| 時間 | 任務摘要 | 專案 | 訊息數 | Output Tokens | 限速 |")
-        lines.append("|------|---------|------|--------|---------------|------|")
-        for s in w.sessions:
-            label = sanitize_text(s.summary or s.first_prompt)
-            rl_mark = f"{s.rate_limit_count}次" if s.rate_limit_count > 0 else "-"
-            lines.append(
-                f"| {fmt_time_short(s.created)} | {label} | "
-                f"{s.project_name} | {s.message_count} | {fmt_tokens(s.output_tokens)} | {rl_mark} |"
-            )
-        lines.append("")
+    if meaningful_tasks:
+        tasks_by_project: dict[str, list[str]] = defaultdict(list)
+        for label, proj, _ in meaningful_tasks:
+            tasks_by_project[proj].append(label)
 
-    # Token breakdown
-    lines.append("---")
-    lines.append("")
-    lines.append("## Token 用量明細")
-    lines.append("")
-    lines.append("| 日期 | 週期 | Sessions | Input | Output | Cache Read | Cache Create | Total | 狀態 |")
-    lines.append("|------|------|----------|-------|--------|------------|--------------|-------|------|")
-    for i, w in enumerate(windows, 1):
-        day = fmt_time(w.anchor).split(" ")[0]
-        time_range = f"{fmt_time_short(w.anchor)}~{fmt_time_short(w.end)}"
-        status_parts = []
-        if is_heavy_window(w):
-            status_parts.append("HIGH")
-        if w.has_rate_limit:
-            status_parts.append(f"限速{w.total_rate_limits}次")
-        status_mark = ", ".join(status_parts) if status_parts else "-"
-        lines.append(
-            f"| {day} | {time_range} | {len(w.sessions)} | "
-            f"{fmt_tokens(w.total_input_tokens)} | {fmt_tokens(w.total_output_tokens)} | "
-            f"{fmt_tokens(w.total_cache_read)} | {fmt_tokens(w.total_cache_creation)} | "
-            f"{fmt_tokens(w.total_tokens)} | {status_mark} |"
-        )
-    lines.append("")
-
-    # Rate limit analysis
-    lines.append("---")
-    lines.append("")
-    lines.append("## 限制分析")
-    lines.append("")
-
-    heavy_list = [
-        (i, w) for i, w in enumerate(windows, 1)
-        if is_heavy_window(w)
-    ]
-
-    if heavy_list:
-        lines.append(f"共 **{len(heavy_list)}** 個高負載週期（佔比 {len(heavy_list)}/{len(windows)}）：")
-        lines.append("")
-        for idx, w in heavy_list:
-            actual_span = (w.sessions[-1].modified - w.sessions[0].created).total_seconds() / 3600
-            reasons = []
-            if len(w.sessions) >= HEAVY_MIN_SESSIONS:
-                reasons.append(f"{len(w.sessions)} sessions")
-            if w.total_messages >= HEAVY_MIN_MESSAGES:
-                reasons.append(f"{w.total_messages} 則訊息")
-            if w.total_output_tokens >= HEAVY_MIN_OUTPUT_TOKENS:
-                reasons.append(f"output {fmt_tokens(w.total_output_tokens)}")
-            lines.append(
-                f"- **[HIGH] 週期 {idx}** ({fmt_time(w.anchor)})："
-                f"跨度 {actual_span:.1f} 小時，"
-                f"觸發條件：{', '.join(reasons)}"
-            )
-        lines.append("")
+        for proj, tasks in tasks_by_project.items():
+            lines.append(f"### {proj}")
+            lines.append("")
+            for t in tasks:
+                lines.append(f"- {t}")
+            lines.append("")
     else:
-        lines.append("目前各週期使用量較為分散，尚未出現高負載使用情形。")
+        lines.append("（無可辨識的工作項目紀錄）")
         lines.append("")
 
-    # Rate limit summary
-    rl_windows = [(i, w) for i, w in enumerate(windows, 1) if w.has_rate_limit]
-    if rl_windows:
-        lines.append(f"### 限速事件")
-        lines.append("")
-        lines.append(
-            f"共 **{sum(w.total_rate_limits for _, w in rl_windows)}** 次限速/過載，"
-            f"影響 **{len(rl_windows)}** 個週期："
-        )
-        lines.append("")
-        for idx, w in rl_windows:
-            all_events = []
-            for s in w.sessions:
-                all_events.extend(s.rate_limit_events)
-            error_types = list(dict.fromkeys(e.error_type for e in all_events))
-            lines.append(
-                f"- **[RATE-LIMITED] 週期 {idx}** ({fmt_time(w.anchor)})："
-                f"{w.total_rate_limits} 次，"
-                f"等待 {w.total_retry_wait_seconds:.1f}s，"
-                f"類型：{', '.join(error_types)}"
-            )
-        lines.append("")
-    else:
-        lines.append("### 限速事件")
-        lines.append("")
-        lines.append("本期間內未偵測到限速/過載事件。")
-        lines.append("")
-
-    lines.append("> **建議：** 若出現 [RATE-LIMITED] 標記，代表已實際觸及方案上限，")
-    lines.append("> 工作被迫中斷等待，建議升級方案以提升效率。")
-    lines.append("")
-
-    # Criteria explanation
+    # --- AI Work Log (daily timeline + rate limits) ---
     lines.append("---")
     lines.append("")
-    lines.append("## 標記定義")
+    lines.append("## AI 工作日誌")
     lines.append("")
-    lines.append("### [HIGH] 高負載")
-    lines.append("週期滿足以下**任一**條件：")
+
+    for day, day_sessions in days_map.items():
+        # Collect meaningful tasks for this day
+        day_tasks = []
+        for s in day_sessions:
+            label = sanitize_text(s.summary or s.first_prompt, max_len=80)
+            if _is_meaningful_task(label):
+                day_tasks.append(label)
+
+        # Rate limit events for this day
+        day_rl = rl_by_date.get(day, [])
+
+        # Skip days with no meaningful tasks and no rate limit events
+        if not day_tasks and not day_rl:
+            continue
+
+        # Day header: session count + duration
+        session_count = len(day_sessions)
+        raw_dur = sum(s.duration_minutes for s in day_sessions)
+        day_dur = min(raw_dur, WINDOW_HOURS * 60)
+
+        # Check if any session spans beyond this day
+        last_modified = max(s.modified for s in day_sessions)
+        last_mod_day = fmt_time(last_modified).split(" ")[0]
+
+        if last_mod_day != day:
+            dur_str = f"持續至 {last_mod_day}"
+        elif day_dur >= 60:
+            dur_str = f"{day_dur / 60:.1f} 小時"
+        else:
+            dur_str = f"{day_dur:.0f} 分鐘"
+
+        lines.append(f"### {day}（{session_count} 個工作階段，{dur_str}）")
+        lines.append("")
+        for t in day_tasks:
+            lines.append(f"- {t}")
+
+        # Inline rate limit events
+        for evt in day_rl:
+            # Extract reset time from message (e.g. "resets 11pm")
+            msg = evt.message
+            reset_part = ""
+            if "resets" in msg.lower():
+                idx = msg.lower().index("resets")
+                reset_part = msg[idx:].strip()
+                # Clean up: "resets 11pm (Asia/Taipei)" → "resets 11pm"
+                if "(" in reset_part:
+                    reset_part = reset_part[:reset_part.index("(")].strip()
+            lines.append(
+                f"- ⚠️ 觸及方案上限，工作中斷等待重置（{reset_part}）"
+            )
+
+        lines.append("")
+
+    # --- Conclusion ---
+    lines.append("---")
     lines.append("")
-    lines.append(f"| 條件 | 門檻值 |")
-    lines.append(f"|------|--------|")
-    lines.append(f"| 週期內 session 數 | >= {HEAVY_MIN_SESSIONS} |")
-    lines.append(f"| 週期內總訊息數 | >= {HEAVY_MIN_MESSAGES} |")
-    lines.append(f"| 週期內總 output tokens | >= {fmt_tokens(HEAVY_MIN_OUTPUT_TOKENS)} |")
+    lines.append("## 結論與建議")
     lines.append("")
-    lines.append("### [RATE-LIMITED] 限速")
-    lines.append("週期內偵測到 API 回傳 429 (rate limit) 或 529 (overloaded) 錯誤，代表已觸及方案用量上限。")
+
+    if matched_hook_events:
+        lines.append(
+            f"1. **已觸及方案上限：** 期間內 {len(matched_hook_events)} 次碰到 Pro 方案用量限制，"
+            f"工作被迫中斷等待重置，直接影響開發效率。"
+        )
+        lines.append(
+            f"2. **建議升級方案：** 升級至更高方案可避免工作中斷，"
+            f"提升開發效率與 AI 工具投資報酬率。"
+        )
+    else:
+        lines.append(
+            "本期間內未觸及方案用量上限，目前額度尚可滿足使用需求。"
+        )
+        lines.append(
+            "建議持續觀察使用趨勢，若觸及上限導致工作中斷，再評估升級方案。"
+        )
     lines.append("")
 
     return "\n".join(lines)
 
 
-def generate_csv_report(sessions: list[SessionRecord], windows: list[Window]) -> str:
+def generate_csv_report(
+    sessions: list[SessionRecord],
+    windows: list[Window],
+    hook_events: list[RateLimitEvent] | None = None,
+) -> str:
     """Generate CSV report, one row per session."""
     # Build session -> window mapping
     session_window: dict[str, int] = {}
@@ -694,14 +731,18 @@ def generate_csv_report(sessions: list[SessionRecord], windows: list[Window]) ->
         for s in w.sessions:
             session_window[s.session_id] = i
 
+    # Build session_id -> hit_limit count from hook events
+    hit_limit_count: dict[str, int] = defaultdict(int)
+    for evt in (hook_events or []):
+        hit_limit_count[evt.session_id] += 1
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
         "date", "start_time", "end_time", "project", "summary",
         "messages", "duration_min", "input_tokens", "output_tokens",
         "cache_read_tokens", "cache_creation_tokens", "total_tokens",
-        "rate_limit_count", "rate_limit_wait_ms",
-        "window_id", "git_branch",
+        "hit_limit", "window_id", "git_branch",
     ])
 
     for s in sessions:
@@ -718,8 +759,7 @@ def generate_csv_report(sessions: list[SessionRecord], windows: list[Window]) ->
             s.cache_read_tokens,
             s.cache_creation_tokens,
             s.total_tokens,
-            s.rate_limit_count,
-            round(s.total_retry_wait_ms, 0),
+            hit_limit_count.get(s.session_id, 0),
             session_window.get(s.session_id, 0),
             s.git_branch,
         ])
@@ -780,11 +820,14 @@ def main():
     # Group into windows
     windows = group_into_windows(sessions)
 
+    # Load hook rate limits
+    hook_events = load_hook_rate_limits()
+
     # Generate report
     if args.format == "csv":
-        report = generate_csv_report(sessions, windows)
+        report = generate_csv_report(sessions, windows, hook_events)
     else:
-        report = generate_markdown_report(sessions, windows, effective_days)
+        report = generate_markdown_report(sessions, windows, effective_days, hook_events)
 
     # Output
     if args.output:

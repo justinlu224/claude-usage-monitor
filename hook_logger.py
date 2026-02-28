@@ -14,11 +14,41 @@ Claude Code Hook Logger
 import json
 import sys
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # 日誌目錄
 LOG_DIR = os.path.expanduser("~/claude-usage-monitor/logs")
 LOG_FILE = os.path.join(LOG_DIR, "hook_events.jsonl")
+
+# 保留天數（與報告預設一致）
+RETENTION_DAYS = 30
+
+
+def cleanup_old_logs():
+    """刪除超過 RETENTION_DAYS 的日誌紀錄。"""
+    if not os.path.exists(LOG_FILE):
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    kept = []
+
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line.strip())
+                    ts_str = rec.get("logged_at", "")
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts >= cutoff:
+                        kept.append(line)
+                except (json.JSONDecodeError, ValueError):
+                    # 無法解析的行保留，避免丟失資料
+                    kept.append(line)
+    except (OSError, IOError):
+        return
+
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.writelines(kept)
 
 
 def main():
@@ -31,6 +61,21 @@ def main():
         hook_data = json.loads(raw) if raw.strip() else {}
     except (json.JSONDecodeError, Exception):
         hook_data = {"raw_input": raw[:500] if raw else "empty"}
+
+    # 每天最多清理一次（用 marker 檔記錄上次清理日期）
+    marker = os.path.join(LOG_DIR, ".last_cleanup")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    need_cleanup = True
+    if os.path.exists(marker):
+        try:
+            with open(marker, "r") as f:
+                need_cleanup = f.read().strip() != today
+        except OSError:
+            pass
+    if need_cleanup:
+        cleanup_old_logs()
+        with open(marker, "w") as f:
+            f.write(today)
 
     # 加上時間戳
     record = {
