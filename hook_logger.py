@@ -8,7 +8,7 @@ Claude Code Hook Logger
   Hook 會透過 stdin 傳入 JSON 資料。
 
 日誌位置：
-  ~/claude-usage-report/logs/hook_events.jsonl
+  ~/claude-usage-reporter/logs/hook_events.jsonl
 """
 
 import json
@@ -18,7 +18,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 # 日誌目錄
-LOG_DIR = os.path.expanduser("~/claude-usage-report/logs")
+LOG_DIR = os.path.expanduser("~/claude-usage-reporter/logs")
 LOG_FILE = os.path.join(LOG_DIR, "hook_events.jsonl")
 
 # 保留天數（與報告預設一致）
