@@ -1,4 +1,4 @@
-# claude-usage-report
+# claude-usage-reporter
 
 A local usage reporting tool for Claude Code. It reads session data from `~/.claude/`, analyzes usage patterns, and generates Markdown reports — ideal for reporting AI tool utilization to management.
 
@@ -68,7 +68,7 @@ Add the following to `~/.claude/settings.json`:
 }
 ```
 
-Hook logs are stored at `~/claude-usage-report/logs/hook_events.jsonl` with automatic 30-day retention.
+Hook logs are stored at `~/claude-usage-reporter/logs/hook_events.jsonl` with automatic 30-day retention.
 
 ## Requirements
 
