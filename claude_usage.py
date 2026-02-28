@@ -18,6 +18,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from hook_logger import LOG_FILE
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -373,7 +374,6 @@ def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEve
     3. Message contains "resets" (fixed format, avoids false positives)
     """
     if not hook_log_path:
-        from hook_logger import LOG_FILE
         hook_log_path = LOG_FILE
 
     events: list[RateLimitEvent] = []
@@ -520,7 +520,6 @@ def _prepare_report_data(
     hook_events: list[RateLimitEvent] | None,
 ) -> dict:
     """Prepare aggregated data used by all report sections."""
-    from collections import OrderedDict
 
     total_messages = sum(s.message_count for s in sessions)
     total_duration = sum(
@@ -540,7 +539,7 @@ def _prepare_report_data(
         if _is_meaningful_task(label):
             meaningful_tasks.append((label, s.project_name, s))
 
-    days_map: OrderedDict[str, list[SessionRecord]] = OrderedDict()
+    days_map: dict[str, list[SessionRecord]] = {}
     for s in sessions:
         day = fmt_time(s.created).split(" ")[0]
         days_map.setdefault(day, []).append(s)
