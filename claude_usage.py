@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Claude Code Pro 用量監控腳本
+Claude Code Pro Usage Monitor
 
-讀取本機 ~/.claude/ 的 session 資料，按 5 小時週期分組，
-產出 Markdown 或 CSV 報告。
+Reads local ~/.claude/ session data, groups by 5-hour windows,
+and generates Markdown or CSV reports.
 
-用法：
-    python3 claude_usage.py                        # 全部專案，近 30 天
-    python3 claude_usage.py --days 7               # 近 7 天
-    python3 claude_usage.py --project health-shop  # 篩選特定專案
-    python3 claude_usage.py --format  csv --output ~/Desktop/report.csv #CSV 格式
-    python3 claude_usage.py --output ~/Desktop/report.md  # 存檔
+Usage:
+    python3 claude_usage.py                        # All projects, last 30 days
+    python3 claude_usage.py --days 7               # Last 7 days
+    python3 claude_usage.py --project health-shop  # Filter by project
+    python3 claude_usage.py --format csv --output ~/Desktop/report.csv  # CSV
+    python3 claude_usage.py --output ~/Desktop/report.md  # Save to file
 """
 
 import argparse
@@ -38,7 +38,7 @@ WINDOW_HOURS = 5
 
 @dataclass
 class RateLimitEvent:
-    """Pro 方案用量上限事件（透過 Hook 偵測）。"""
+    """Pro plan rate limit event (detected via Hook)."""
     timestamp: datetime
     session_id: str
     message: str         # e.g. "You've hit your limit · resets 8pm (Asia/Taipei)"
@@ -68,11 +68,11 @@ class SessionRecord:
 
     @property
     def duration_minutes(self) -> float:
-        """Session 工作時長（分鐘）。
+        """Session working duration in minutes.
 
-        異常值處理：
-        - 超過 5 小時（如 /resume 跨天）→ 以訊息數估算（每則約 1 分鐘）
-        - 低於 1 分鐘但訊息數多（如壓縮後續接）→ 以訊息數估算
+        Outlier handling:
+        - Over 5 hours (e.g. /resume across days) -> estimate by message count (~1 min each)
+        - Under 1 minute but many messages (e.g. resumed after compression) -> estimate by message count
         """
         delta = self.modified - self.created
         mins = max(delta.total_seconds() / 60, 0)
@@ -134,7 +134,7 @@ def get_project_name(project_path: str) -> str:
 
 
 def _extract_user_text(rec: dict) -> str:
-    """從 user record 中提取文字內容。"""
+    """Extract text content from a user record."""
     content = rec.get("message", {}).get("content", "")
     if isinstance(content, str):
         return content.strip()
@@ -145,17 +145,17 @@ def _extract_user_text(rec: dict) -> str:
     return ""
 
 
-# 系統訊息的前綴特徵，不是真正的使用者輸入
+# System message prefixes — not real user input
 _SYSTEM_PREFIXES = (
     "<",              # XML tags: <command-name>, <local-command-*>, <system-reminder>
-    "Caveat:",        # Claude Code 自動產生的 caveat 訊息
-    "Base directory", # Skill 載入提示
+    "Caveat:",        # Auto-generated caveat messages
+    "Base directory", # Skill loading prompt
     "[Request ",      # [Request interrupted by user]
 )
 
 
 def _is_real_user_input(text: str) -> bool:
-    """判斷文字是否為真正的使用者輸入（非系統訊息）。"""
+    """Check if text is real user input (not a system message)."""
     return not text.startswith(_SYSTEM_PREFIXES)
 
 
@@ -360,15 +360,16 @@ def load_all_sessions(
 
 
 def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEvent]:
-    """從 Hook 日誌讀取方案上限事件。
+    """Load plan rate limit events from Hook logs.
 
-    Hook 日誌由 hook_logger.py 寫入，當 Stop 事件的
-    last_assistant_message 以 "You've hit your limit" 開頭時，即為方案限速。
+    Hook logs are written by hook_logger.py. A Stop event whose
+    last_assistant_message starts with "You've hit your limit" indicates
+    a plan rate limit.
 
-    判斷條件（必須全部滿足）：
+    Match criteria (all must be met):
     1. hook_event == "Stop"
-    2. last_assistant_message 以 "You've hit your limit" 開頭
-    3. 訊息中包含 "resets"（限速訊息固定格式，避免誤判對話內容）
+    2. last_assistant_message starts with "You've hit your limit"
+    3. Message contains "resets" (fixed format, avoids false positives)
     """
     if not hook_log_path:
         hook_log_path = os.path.expanduser(
@@ -397,7 +398,7 @@ def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEve
                 data = rec.get("data", {})
                 msg = data.get("last_assistant_message", "")
 
-                # 嚴格判斷：必須以固定格式開頭且包含 resets
+                # Strict match: must start with fixed prefix and contain "resets"
                 if not (msg.startswith("You've hit your limit")
                         and "resets" in msg.lower()):
                     continue
@@ -455,11 +456,11 @@ def group_into_windows(sessions: list[SessionRecord]) -> list[Window]:
 def sanitize_text(text: str, max_len: int = 60) -> str:
     """Sanitize text for Markdown table cells (strip newlines, truncate)."""
     clean = text.replace("\n", " ").replace("\r", " ").replace("|", "/").strip()
-    # 清理 markdown 語法
+    # Strip markdown syntax
     import re
     clean = re.sub(r"#{1,6}\s*", "", clean)      # ## heading → heading
     clean = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", clean)  # **bold** → bold
-    clean = re.sub(r"\s{2,}", " ", clean)         # 多餘空白
+    clean = re.sub(r"\s{2,}", " ", clean)         # collapse whitespace
     clean = clean.strip()
     if len(clean) > max_len:
         clean = clean[:max_len] + "…"
@@ -490,7 +491,7 @@ def fmt_time_short(dt: datetime) -> str:
 # Task filtering
 # ---------------------------------------------------------------------------
 
-# 非實質工作的關鍵字，從任務清單中排除
+# Keywords for non-substantive work, excluded from task list
 _SKIP_TASK_KEYWORDS = (
     "Summarize this",
     "claude install",
@@ -500,7 +501,7 @@ _SKIP_TASK_KEYWORDS = (
 
 
 def _is_meaningful_task(label: str) -> bool:
-    """判斷任務摘要是否為有意義的實質工作。"""
+    """Check if a task summary represents meaningful work."""
     if not label or len(label) < 5:
         return False
     for kw in _SKIP_TASK_KEYWORDS:
@@ -572,50 +573,50 @@ def generate_markdown_report(
     else:
         start_date = end_date = "N/A"
 
-    period = f"近 {days} 天（{start_date} — {end_date}）" if days else f"{start_date} — {end_date}"
+    period = f"Last {days} days ({start_date} — {end_date})" if days else f"{start_date} — {end_date}"
 
-    lines.append("# Claude Code Pro 使用報告")
+    lines.append("# Claude Code Pro Usage Report")
     lines.append("")
-    lines.append(f"**報告期間：** {period}")
+    lines.append(f"**Period:** {period}")
     lines.append("")
 
     # --- Executive Summary ---
-    lines.append("## 執行摘要")
+    lines.append("## Executive Summary")
     lines.append("")
     lines.append(
-        f"本期間內透過 Claude Code AI 輔助，在 **{active_days}** 個工作日中"
-        f"完成 **{len(meaningful_tasks)}** 項開發任務，"
-        f"累計 **{total_messages}** 次 AI 互動，"
-        f"總工作時長約 **{total_duration / 60:.1f} 小時**。"
+        f"During this period, Claude Code AI assisted development across "
+        f"**{active_days}** active days, completing **{len(meaningful_tasks)}** tasks "
+        f"with **{total_messages}** AI interactions "
+        f"over approximately **{total_duration / 60:.1f} hours** of total working time."
     )
     if matched_hook_events:
         lines.append(
-            f"期間內 **{len(matched_hook_events)} 次觸及方案用量上限**，"
-            f"導致工作被迫中斷等待重置。"
+            f"The plan usage limit was hit **{len(matched_hook_events)} time(s)**, "
+            f"forcing work interruptions while waiting for reset."
         )
     lines.append("")
 
     # --- Usage Overview (simplified key metrics) ---
     lines.append("---")
     lines.append("")
-    lines.append("## 使用概況")
+    lines.append("## Usage Overview")
     lines.append("")
-    lines.append("| 指標 | 數值 |")
-    lines.append("|------|------|")
-    lines.append(f"| 活躍工作日 | {active_days} 天 |")
-    lines.append(f"| AI 互動總數 | {total_messages} |")
-    lines.append(f"| 總使用時長 | {total_duration / 60:.1f} 小時 |")
-    lines.append(f"| 平均每日互動數 | {total_messages / max(active_days, 1):.0f} |")
-    lines.append(f"| 觸及方案上限 | {len(matched_hook_events)} 次 |")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Active Days | {active_days} |")
+    lines.append(f"| Total AI Interactions | {total_messages} |")
+    lines.append(f"| Total Working Hours | {total_duration / 60:.1f} hrs |")
+    lines.append(f"| Avg. Interactions / Day | {total_messages / max(active_days, 1):.0f} |")
+    lines.append(f"| Plan Limit Hits | {len(matched_hook_events)} |")
     projects_with_tasks = list(dict.fromkeys(proj for _, proj, _ in meaningful_tasks))
     if projects_with_tasks:
-        lines.append(f"| 涵蓋專案 | {', '.join(projects_with_tasks)} |")
+        lines.append(f"| Projects | {', '.join(projects_with_tasks)} |")
     lines.append("")
 
     # --- Tasks completed ---
     lines.append("---")
     lines.append("")
-    lines.append("## 完成任務總覽")
+    lines.append("## Completed Tasks")
     lines.append("")
 
     if meaningful_tasks:
@@ -630,13 +631,13 @@ def generate_markdown_report(
                 lines.append(f"- {t}")
             lines.append("")
     else:
-        lines.append("（無可辨識的工作項目紀錄）")
+        lines.append("(No identifiable work items recorded)")
         lines.append("")
 
     # --- AI Work Log (daily timeline + rate limits) ---
     lines.append("---")
     lines.append("")
-    lines.append("## AI 工作日誌")
+    lines.append("## AI Work Log")
     lines.append("")
 
     for day, day_sessions in days_map.items():
@@ -664,13 +665,13 @@ def generate_markdown_report(
         last_mod_day = fmt_time(last_modified).split(" ")[0]
 
         if last_mod_day != day:
-            dur_str = f"持續至 {last_mod_day}"
+            dur_str = f"continued to {last_mod_day}"
         elif day_dur >= 60:
-            dur_str = f"{day_dur / 60:.1f} 小時"
+            dur_str = f"{day_dur / 60:.1f} hrs"
         else:
-            dur_str = f"{day_dur:.0f} 分鐘"
+            dur_str = f"{day_dur:.0f} min"
 
-        lines.append(f"### {day}（{session_count} 個工作階段，{dur_str}）")
+        lines.append(f"### {day} ({session_count} sessions, {dur_str})")
         lines.append("")
         for t in day_tasks:
             lines.append(f"- {t}")
@@ -687,7 +688,7 @@ def generate_markdown_report(
                 if "(" in reset_part:
                     reset_part = reset_part[:reset_part.index("(")].strip()
             lines.append(
-                f"- ⚠️ 觸及方案上限，工作中斷等待重置（{reset_part}）"
+                f"- Hit plan limit — work interrupted, waiting for reset ({reset_part})"
             )
 
         lines.append("")
@@ -695,24 +696,27 @@ def generate_markdown_report(
     # --- Conclusion ---
     lines.append("---")
     lines.append("")
-    lines.append("## 結論與建議")
+    lines.append("## Conclusion & Recommendations")
     lines.append("")
 
     if matched_hook_events:
         lines.append(
-            f"1. **已觸及方案上限：** 期間內 {len(matched_hook_events)} 次碰到 Pro 方案用量限制，"
-            f"工作被迫中斷等待重置，直接影響開發效率。"
+            f"1. **Plan limit reached:** Hit the Pro plan usage limit "
+            f"{len(matched_hook_events)} time(s) during this period, "
+            f"forcing work interruptions and directly impacting development efficiency."
         )
         lines.append(
-            f"2. **建議升級方案：** 升級至更高方案可避免工作中斷，"
-            f"提升開發效率與 AI 工具投資報酬率。"
+            f"2. **Recommend plan upgrade:** Upgrading to a higher plan would eliminate "
+            f"work interruptions and improve AI tool ROI."
         )
     else:
         lines.append(
-            "本期間內未觸及方案用量上限，目前額度尚可滿足使用需求。"
+            "No plan usage limits were hit during this period. "
+            "Current quota is sufficient for the workload."
         )
         lines.append(
-            "建議持續觀察使用趨勢，若觸及上限導致工作中斷，再評估升級方案。"
+            "Recommend continued monitoring of usage trends. "
+            "Consider upgrading if limits are reached and work is interrupted."
         )
     lines.append("")
 
@@ -773,27 +777,27 @@ def generate_csv_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code Pro 用量監控 — 分析 session 資料並產出報告"
+        description="Claude Code Pro Usage Monitor — analyze session data and generate reports"
     )
     parser.add_argument(
         "--days", type=int, default=30,
-        help="分析近 N 天的資料（預設 30，設 0 顯示全部）"
+        help="Analyze last N days of data (default: 30, 0 = all)"
     )
     parser.add_argument(
         "--project", type=str, default=None,
-        help="篩選特定專案名稱（模糊比對）"
+        help="Filter by project name (fuzzy match)"
     )
     parser.add_argument(
         "--format", choices=["markdown", "csv"], default="markdown",
-        help="輸出格式（預設 markdown）"
+        help="Output format (default: markdown)"
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="輸出到檔案（預設印到 stdout）"
+        help="Write output to file (default: stdout)"
     )
     parser.add_argument(
         "--claude-dir", type=str, default=None,
-        help="Claude 資料目錄（預設 ~/.claude）"
+        help="Claude data directory (default: ~/.claude)"
     )
 
     args = parser.parse_args()
@@ -807,14 +811,14 @@ def main():
     sessions = load_all_sessions(claude_dir, args.project, effective_days)
 
     if not sessions:
-        print("找不到符合條件的 session 資料。", file=sys.stderr)
-        print(f"  搜尋目錄: {claude_dir}/projects/", file=sys.stderr)
+        print("No matching session data found.", file=sys.stderr)
+        print(f"  Search directory: {claude_dir}/projects/", file=sys.stderr)
         if args.project:
-            print(f"  專案篩選: {args.project}", file=sys.stderr)
+            print(f"  Project filter: {args.project}", file=sys.stderr)
         if effective_days:
-            print(f"  天數範圍: 近 {effective_days} 天", file=sys.stderr)
+            print(f"  Date range: last {effective_days} days", file=sys.stderr)
         else:
-            print("  天數範圍: 全部", file=sys.stderr)
+            print("  Date range: all", file=sys.stderr)
         sys.exit(1)
 
     # Group into windows
@@ -835,7 +839,7 @@ def main():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"報告已輸出到: {output_path}", file=sys.stderr)
+        print(f"Report saved to: {output_path}", file=sys.stderr)
     else:
         print(report)
 
