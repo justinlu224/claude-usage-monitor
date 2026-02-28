@@ -55,12 +55,13 @@ def main():
     # 確保日誌目錄存在
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # 從 stdin 讀取 Hook 傳入的 JSON
+    # 從 stdin 讀取 Hook 傳入的 JSON（限制 1MB 避免磁碟空間耗盡）
+    MAX_INPUT_BYTES = 1_000_000
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read(MAX_INPUT_BYTES)
         hook_data = json.loads(raw) if raw.strip() else {}
     except (json.JSONDecodeError, Exception):
-        hook_data = {"raw_input": raw[:500] if raw else "empty"}
+        hook_data = {}
 
     # 每天最多清理一次（用 marker 檔記錄上次清理日期）
     marker = os.path.join(LOG_DIR, ".last_cleanup")
@@ -77,12 +78,15 @@ def main():
         with open(marker, "w") as f:
             f.write(today)
 
-    # 加上時間戳
+    # 僅保留必要欄位，避免將完整對話內容寫入日誌
     record = {
         "logged_at": datetime.now(timezone.utc).isoformat(),
         "hook_event": hook_data.get("hook_event_name", "unknown"),
         "session_id": hook_data.get("session_id", ""),
-        "data": hook_data,
+        "data": {
+            "session_id": hook_data.get("session_id", ""),
+            "last_assistant_message": hook_data.get("last_assistant_message", ""),
+        },
     }
 
     # 寫入日誌（append 模式）

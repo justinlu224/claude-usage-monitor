@@ -292,8 +292,11 @@ def load_all_sessions(
                 if cutoff and created < cutoff:
                     continue
 
-                # Parse JSONL for token usage
+                # Parse JSONL for token usage (validate path is within claude_dir)
                 jsonl_path = entry.get("fullPath", "")
+                claude_dir_real = os.path.realpath(claude_dir) + os.sep
+                if jsonl_path and not os.path.realpath(jsonl_path).startswith(claude_dir_real):
+                    jsonl_path = ""
                 parsed = parse_jsonl(jsonl_path) if jsonl_path and os.path.exists(jsonl_path) else {}
 
                 sessions.append(SessionRecord(
