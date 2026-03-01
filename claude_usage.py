@@ -415,6 +415,35 @@ def load_hook_rate_limits(hook_log_path: str | None = None) -> list[RateLimitEve
     return events
 
 
+def _parse_reset_minutes(evt: RateLimitEvent) -> int | None:
+    """Estimate lost minutes from a rate limit event.
+
+    Parses the reset time (e.g. "resets 8pm") from the event message,
+    then calculates the difference from the event timestamp.
+    Returns None if the reset time cannot be parsed.
+    """
+    match = re.search(r"resets\s+(\d{1,2})(am|pm)", evt.message, re.IGNORECASE)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    if not 1 <= hour <= 12:
+        return None
+    period = match.group(2).lower()
+    if period == "pm" and hour != 12:
+        hour += 12
+    elif period == "am" and hour == 12:
+        hour = 0
+
+    local_ts = evt.timestamp.astimezone()
+    reset_dt = local_ts.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if reset_dt <= local_ts:
+        reset_dt += timedelta(days=1)
+
+    lost = int((reset_dt - local_ts).total_seconds() / 60)
+    # Cap at 5 hours to avoid unreasonable values
+    return min(lost, 300)
+
 
 # ---------------------------------------------------------------------------
 # Windowing
@@ -559,6 +588,14 @@ def _prepare_report_data(
     for evt in matched_hook_events:
         active_dates.add(fmt_time(evt.timestamp).split(" ")[0])
 
+    rl_lost_minutes: dict[str, int] = {}
+    total_rl_lost_minutes = 0
+    for evt in matched_hook_events:
+        lost = _parse_reset_minutes(evt)
+        if lost is not None:
+            rl_lost_minutes[evt.timestamp.isoformat()] = lost
+            total_rl_lost_minutes += lost
+
     return {
         "total_messages": total_messages,
         "total_duration": total_duration,
@@ -566,6 +603,8 @@ def _prepare_report_data(
         "meaningful_tasks": meaningful_tasks,
         "days_map": days_map,
         "rl_by_date": rl_by_date,
+        "rl_lost_minutes": rl_lost_minutes,
+        "total_rl_lost_minutes": total_rl_lost_minutes,
         "active_days": len(active_dates),
     }
 
@@ -590,19 +629,22 @@ def _render_header(sessions: list[SessionRecord], days: int | None) -> list[str]
 
 def _render_executive_summary(data: dict) -> list[str]:
     """Render the Executive Summary section."""
-    lines = [
-        "## Executive Summary",
-        "",
+    summary = (
         f"During this period, Claude Code AI assisted development across "
-        f"**{data['active_days']}** active days, completing **{len(data['meaningful_tasks'])}** tasks "
-        f"with **{data['total_messages']}** AI interactions "
-        f"over approximately **{data['total_duration'] / 60:.1f} hours** of total working time.",
-    ]
+        f"**{data['active_days']}** active days, completing "
+        f"**{len(data['meaningful_tasks'])}** tasks over approximately "
+        f"**{data['total_duration'] / 60:.1f} hours** of total working time."
+    )
+    lines = ["## Executive Summary", "", summary]
     if data["matched_hook_events"]:
-        lines.append(
-            f"The plan usage limit was hit **{len(data['matched_hook_events'])} time(s)**, "
-            f"forcing work interruptions while waiting for reset."
+        count = len(data['matched_hook_events'])
+        lost_total = data["total_rl_lost_minutes"]
+        impact = (
+            f"causing approximately **{lost_total / 60:.1f} hours** of work interruption."
+            if lost_total > 0
+            else "forcing work interruptions while waiting for reset."
         )
+        lines.append(f"The plan usage limit was hit **{count} time(s)**, {impact}")
     lines.append("")
     return lines
 
@@ -627,6 +669,9 @@ def _render_usage_overview(data: dict) -> list[str]:
         f"| Avg. Interactions / Day | {total_messages / max(active_days, 1):.0f} |",
         f"| Plan Limit Hits | {len(matched_hook_events)} |",
     ]
+    lost_total = data["total_rl_lost_minutes"]
+    if matched_hook_events and lost_total > 0:
+        lines.append(f"| Est. Time Lost to Rate Limits | {lost_total / 60:.1f} hrs |")
     projects_with_tasks = list(dict.fromkeys(proj for _, proj, _ in meaningful_tasks))
     if projects_with_tasks:
         lines.append(f"| Projects | {', '.join(sanitize_text(p) for p in projects_with_tasks)} |")
@@ -694,6 +739,7 @@ def _render_work_log(data: dict) -> list[str]:
         for t in day_tasks:
             lines.append(f"- {t}")
 
+        rl_lost = data["rl_lost_minutes"]
         for evt in day_rl:
             msg = evt.message
             reset_part = ""
@@ -702,8 +748,12 @@ def _render_work_log(data: dict) -> list[str]:
                 reset_part = msg[idx:].strip()
                 if "(" in reset_part:
                     reset_part = reset_part[:reset_part.index("(")].strip()
+            trigger_time = fmt_time_short(evt.timestamp)
+            lost = rl_lost.get(evt.timestamp.isoformat())
+            lost_str = f", ~{lost} min lost" if lost is not None else ""
             lines.append(
-                f"- Hit plan limit — work interrupted, waiting for reset ({html.escape(reset_part)})"
+                f"- Hit plan limit at {trigger_time} — work interrupted, "
+                f"waiting for reset ({sanitize_text(reset_part)}{lost_str})"
             )
 
         lines.append("")
@@ -717,15 +767,24 @@ def _render_conclusion(data: dict) -> list[str]:
     lines = ["---", "", "## Conclusion & Recommendations", ""]
 
     if matched_hook_events:
-        lines.append(
-            f"1. **Plan limit reached:** Hit the plan usage limit "
-            f"{len(matched_hook_events)} time(s) during this period, "
-            f"forcing work interruptions and directly impacting development efficiency."
+        count = len(matched_hook_events)
+        lost_total = data["total_rl_lost_minutes"]
+        recommendations = [
+            f"**Plan limit reached:** Hit the plan usage limit "
+            f"{count} time(s) during this period, "
+            f"forcing work interruptions and directly impacting development efficiency.",
+        ]
+        if lost_total > 0:
+            recommendations.append(
+                f"**Estimated time lost:** Approximately {lost_total / 60:.1f} hours "
+                f"of development time was lost waiting for plan limit resets."
+            )
+        recommendations.append(
+            "**Recommend plan upgrade:** Upgrading to a higher plan "
+            "would eliminate work interruptions and improve AI tool ROI."
         )
-        lines.append(
-            f"2. **Recommend plan upgrade:** Upgrading to a higher plan would eliminate "
-            f"work interruptions and improve AI tool ROI."
-        )
+        for i, rec in enumerate(recommendations, 1):
+            lines.append(f"{i}. {rec}")
     else:
         lines.append(
             "No plan usage limits were hit during this period. "
