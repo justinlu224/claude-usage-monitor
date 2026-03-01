@@ -427,6 +427,8 @@ def _parse_reset_minutes(evt: RateLimitEvent) -> int | None:
         return None
 
     hour = int(match.group(1))
+    if not 1 <= hour <= 12:
+        return None
     period = match.group(2).lower()
     if period == "pm" and hour != 12:
         hour += 12
@@ -637,16 +639,12 @@ def _render_executive_summary(data: dict) -> list[str]:
     if data["matched_hook_events"]:
         count = len(data['matched_hook_events'])
         lost_total = data["total_rl_lost_minutes"]
-        if lost_total > 0:
-            lines.append(
-                f"The plan usage limit was hit **{count} time(s)**, "
-                f"causing approximately **{lost_total / 60:.1f} hours** of work interruption."
-            )
-        else:
-            lines.append(
-                f"The plan usage limit was hit **{count} time(s)**, "
-                f"forcing work interruptions while waiting for reset."
-            )
+        impact = (
+            f"causing approximately **{lost_total / 60:.1f} hours** of work interruption."
+            if lost_total > 0
+            else "forcing work interruptions while waiting for reset."
+        )
+        lines.append(f"The plan usage limit was hit **{count} time(s)**, {impact}")
     lines.append("")
     return lines
 
@@ -755,7 +753,7 @@ def _render_work_log(data: dict) -> list[str]:
             lost_str = f", ~{lost} min lost" if lost is not None else ""
             lines.append(
                 f"- Hit plan limit at {trigger_time} — work interrupted, "
-                f"waiting for reset ({html.escape(reset_part)}{lost_str})"
+                f"waiting for reset ({sanitize_text(reset_part)}{lost_str})"
             )
 
         lines.append("")
@@ -771,20 +769,22 @@ def _render_conclusion(data: dict) -> list[str]:
     if matched_hook_events:
         count = len(matched_hook_events)
         lost_total = data["total_rl_lost_minutes"]
-        lines.append(
-            f"1. **Plan limit reached:** Hit the plan usage limit "
+        recommendations = [
+            f"**Plan limit reached:** Hit the plan usage limit "
             f"{count} time(s) during this period, "
-            f"forcing work interruptions and directly impacting development efficiency."
-        )
+            f"forcing work interruptions and directly impacting development efficiency.",
+        ]
         if lost_total > 0:
-            lines.append(
-                f"2. **Estimated time lost:** Approximately {lost_total / 60:.1f} hours "
+            recommendations.append(
+                f"**Estimated time lost:** Approximately {lost_total / 60:.1f} hours "
                 f"of development time was lost waiting for plan limit resets."
             )
-        lines.append(
-            f"{3 if lost_total > 0 else 2}. **Recommend plan upgrade:** Upgrading to a higher plan "
-            f"would eliminate work interruptions and improve AI tool ROI."
+        recommendations.append(
+            "**Recommend plan upgrade:** Upgrading to a higher plan "
+            "would eliminate work interruptions and improve AI tool ROI."
         )
+        for i, rec in enumerate(recommendations, 1):
+            lines.append(f"{i}. {rec}")
     else:
         lines.append(
             "No plan usage limits were hit during this period. "
