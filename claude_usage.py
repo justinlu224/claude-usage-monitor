@@ -16,6 +16,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from hook_logger import LOG_FILE
@@ -457,9 +458,10 @@ def sanitize_text(text: str, max_len: int = 60) -> str:
     """Sanitize text for Markdown table cells (strip newlines, truncate)."""
     clean = text.replace("\n", " ").replace("\r", " ").replace("|", "/").strip()
     # Strip markdown syntax
-    import re
-    clean = re.sub(r"#{1,6}\s*", "", clean)      # ## heading → heading
+    clean = re.sub(r"^#{1,6}\s+", "", clean)      # ## heading → heading (line-start only)
     clean = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", clean)  # **bold** → bold
+    clean = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", clean)       # ![alt](url) → remove images
+    clean = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", clean)   # [text](url) → text
     clean = re.sub(r"\s{2,}", " ", clean)         # collapse whitespace
     clean = clean.strip()
     if len(clean) > max_len:
@@ -539,10 +541,10 @@ def _prepare_report_data(
         if _is_meaningful_task(label):
             meaningful_tasks.append((label, s.project_name, s))
 
-    days_map: dict[str, list[SessionRecord]] = {}
+    days_map: dict[str, list[SessionRecord]] = defaultdict(list)
     for s in sessions:
         day = fmt_time(s.created).split(" ")[0]
-        days_map.setdefault(day, []).append(s)
+        days_map[day].append(s)
 
     rl_by_date: dict[str, list[RateLimitEvent]] = defaultdict(list)
     for evt in matched_hook_events:
