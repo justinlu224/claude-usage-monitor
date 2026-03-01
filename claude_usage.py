@@ -460,8 +460,8 @@ def sanitize_text(text: str, max_len: int = 60) -> str:
     # Strip markdown syntax
     clean = re.sub(r"^#{1,6}\s+", "", clean)      # ## heading → heading (line-start only)
     clean = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", clean)  # **bold** → bold
-    clean = re.sub(r"!\[[^\]]*\]\([^)]*(?:\)[^)]*)*\)", "", clean)      # ![alt](url) → remove
-    clean = re.sub(r"\[([^\]]*)\]\([^)]*(?:\)[^)]*)*\)", r"\1", clean)  # [text](url) → text
+    clean = re.sub(r"!\[[^\]]*\]\([^()]*(?:\([^()]*\)[^()]*)*\)", "", clean)      # ![alt](url) → remove
+    clean = re.sub(r"\[([^\]]*)\]\([^()]*(?:\([^()]*\)[^()]*)*\)", r"\1", clean)  # [text](url) → text
     clean = re.sub(r"\s{2,}", " ", clean)         # collapse whitespace
     clean = clean.strip()
     if len(clean) > max_len:
