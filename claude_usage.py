@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code Usage Monitor
+Claude Code Usage Reporter
 
 Reads local ~/.claude/ session data, groups by 5-hour windows,
 and generates a Markdown report.
@@ -761,7 +761,7 @@ def generate_markdown_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code Usage Monitor — analyze session data and generate reports"
+        description="Claude Code Usage Reporter — analyze session data and generate reports"
     )
     parser.add_argument(
         "--days", type=int, default=30,
